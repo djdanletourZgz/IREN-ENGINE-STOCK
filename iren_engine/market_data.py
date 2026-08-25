@@ -36,9 +36,16 @@ def history(ticker: str, period: str, interval: str, prepost: bool = False) -> p
     return _clean(df)
 
 
+def _safe_history(ticker: str, period: str, interval: str, prepost: bool = False) -> pd.DataFrame:
+    try:
+        return history(ticker, period, interval, prepost=prepost)
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_daily(tickers: list[str], period: str = "5y") -> Dict[str, pd.DataFrame]:
-    return {t: history(t, period, "1d") for t in tickers}
+    return {t: _safe_history(t, period, "1d") for t in tickers}
 
 
 def load_intraday(tickers: list[str], period: str = "60d", interval: str = "5m") -> Dict[str, pd.DataFrame]:
-    return {t: history(t, period, interval, prepost=False) for t in tickers}
+    return {t: _safe_history(t, period, interval, prepost=False) for t in tickers}
