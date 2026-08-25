@@ -10,22 +10,26 @@ import streamlit as st
 
 from iren_engine.config import CFG
 from iren_engine.market_data import load_daily
-from iren_engine.probability import build_daily_state
+from iren_engine.probability import build_daily_state, daily_probabilities
+from iren_engine.v2a import build_v2a_state, v2a_probabilities
 from iren_engine.backtest import (
     walk_forward_backtest,
     calibration_summary,
     directional_summary,
     calibration_bins,
+    performance_by_period,
+    performance_by_ai_regime,
+    model_comparison,
     human_verdict,
 )
 
-BACKTEST_VERSION = "1.1"
+BACKTEST_VERSION = "2.0-A"
 
-st.set_page_config(page_title="IREN Backtest V1.1", page_icon="🧪", layout="wide")
-st.title("🧪 IREN Engine — Backtest walk-forward")
+st.set_page_config(page_title="IREN Backtest V2-A", page_icon="🧪", layout="wide")
+st.title("🧪 IREN Engine — V1 vs V2-A")
 st.caption(
-    "Simula qué habría dicho el motor en cada fecha histórica usando únicamente "
-    "información disponible hasta ese día, y después lo compara con lo que ocurrió realmente."
+    "Misma prueba walk-forward para saber si añadir universo IA + fuerza relativa + recencia "
+    "mejora de verdad la predicción direccional. Sin mirar datos futuros."
 )
 
 with st.sidebar:
@@ -33,260 +37,235 @@ with st.sidebar:
     k = st.slider("Vecinos históricos", 60, 200, CFG.daily_neighbors, 10)
     test_window = st.slider("Últimas fechas de test", 150, 600, 350, 25)
     min_train = st.slider("Mínimo de días previos", 150, 350, 220, 10)
-    st.caption("Más fechas = test más robusto pero tarda más. 350 es un buen punto de partida.")
+    st.caption("Ejecuta primero con 120 vecinos / 350 fechas / 220 días para comparar con V1.1.")
 
 
 @st.cache_data(ttl=3600)
-def get_state():
-    tickers = [CFG.ticker, CFG.btc, CFG.qqq, CFG.nvda]
+def get_states():
+    tickers = list(dict.fromkeys([
+        CFG.ticker, CFG.btc, CFG.qqq, CFG.nvda, CFG.vix, *CFG.ai_basket
+    ]))
     daily = load_daily(tickers, CFG.daily_period)
-    return build_daily_state(
-        daily[CFG.ticker],
-        daily[CFG.btc],
-        daily[CFG.qqq],
-        daily.get(CFG.nvda),
+    v1 = build_daily_state(
+        daily[CFG.ticker], daily[CFG.btc], daily[CFG.qqq], daily.get(CFG.nvda)
     )
+    market = {k: v for k, v in daily.items() if k != CFG.ticker}
+    v2 = build_v2a_state(daily[CFG.ticker], market, ai_tickers=CFG.ai_basket)
+    return v1, v2
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_bt(state: pd.DataFrame, k: int, min_train: int, test_window: int):
-    return walk_forward_backtest(
-        state,
+def run_both(v1: pd.DataFrame, v2: pd.DataFrame, k: int, min_train: int, test_window: int):
+    bt1 = walk_forward_backtest(
+        v1,
         k=k,
         min_train=min_train,
         test_window=test_window,
+        predictor=daily_probabilities,
+        model_name="V1",
     )
+    bt2 = walk_forward_backtest(
+        v2,
+        k=k,
+        min_train=min_train,
+        test_window=test_window,
+        predictor=v2a_probabilities,
+        model_name="V2-A",
+        predictor_kwargs={
+            "lookback_rows": CFG.v2_lookback_rows,
+            "recency_half_life": CFG.v2_recency_half_life,
+        },
+    )
+    return pd.concat([bt1, bt2], ignore_index=True)
 
 
-def build_feedback_zip(
-    bt: pd.DataFrame,
-    cal: pd.DataFrame,
-    dirsum: pd.DataFrame,
-    bins: pd.DataFrame,
-    params: tuple[int, int, int],
-    verdict: str,
-) -> bytes:
-    """Paquete único para enviar el backtest completo como feedback."""
+def build_feedback_zip(bt, cal, dirsum, bins, periods, regimes, comparison, params, verdict_v1, verdict_v2):
     k0, min_train0, test_window0 = params
-    unique_dates = int(bt["date"].nunique()) if not bt.empty else 0
-
     meta = {
         "backtest_version": BACKTEST_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "ticker": CFG.ticker,
-        "features": ["IREN técnicos/precio", "BTC", "QQQ", "NVDA"],
-        "gamma_included": False,
+        "models": {
+            "V1": ["IREN técnicos/precio", "BTC", "QQQ", "NVDA"],
+            "V2-A": [
+                "IREN técnicos/precio",
+                "AI factor dinámico (SOXX/NVDA/MU/MRVL/AVGO/AMD/VRT/CRWV/NBIS)",
+                "fuerza relativa IREN vs IA",
+                "breadth/dispersion/correlación IA",
+                "QQQ/VIX/BTC contexto",
+                "ponderación por recencia",
+            ],
+        },
+        "gamma_included_in_probability": False,
         "news_included": False,
         "k_neighbors": int(k0),
         "min_train_days": int(min_train0),
         "test_window_dates": int(test_window0),
-        "dates_simulated": unique_dates,
-        "horizons": sorted(bt["horizon"].dropna().astype(int).unique().tolist()),
-        "verdict": verdict,
-        "benchmark": (
-            "rolling base-rate: en cada fecha sólo usa resultados históricos "
-            "cuyo horizonte ya había terminado"
-        ),
+        "v2_lookback_rows": CFG.v2_lookback_rows,
+        "v2_recency_half_life": CFG.v2_recency_half_life,
+        "verdict_v1": verdict_v1,
+        "verdict_v2a": verdict_v2,
     }
+    readme = f"""IREN ENGINE — FEEDBACK BACKTEST V{BACKTEST_VERSION}
 
-    readme = f"""IREN ENGINE — PAQUETE DE FEEDBACK BACKTEST V{BACKTEST_VERSION}
+OBJETIVO
+Comparar V1 contra V2-A sin cambiar la vara de medir.
 
-Este ZIP está pensado para enviarlo completo como feedback.
+V2-A añade universo IA, fuerza relativa y recencia. Todavía NO integra Gamma ni noticias.
 
 ARCHIVOS
-- predictions_all.csv: TODAS las predicciones walk-forward y resultados reales.
-- calibration.csv: Brier, benchmark rolling y Brier skill por horizonte/evento.
-- directional_signals.csv: rendimiento cuando el modelo da señal fuerte.
-- calibration_bins.csv: qué ocurre realmente en cada rango de P(cerrar arriba).
-- metadata.json: parámetros exactos del test y versión.
-- README.txt: este fichero.
+- predictions_all.csv: todas las predicciones y realidad de ambos modelos.
+- model_comparison.csv: comparación directa V1 vs V2-A.
+- calibration.csv: Brier/Brier skill por modelo/horizonte/evento.
+- directional_signals.csv: señales >=60% o <=40%.
+- calibration_bins.csv: calibración por rangos de probabilidad.
+- performance_by_period.csv: estabilidad cronológica (3 tramos).
+- performance_by_ai_regime.csv: comportamiento por RISK-ON / MIXTO / RISK-OFF IA.
+- metadata.json
+- README.txt
 
-IMPORTANTE
-- Gamma histórico: NO incluido.
-- Noticias: NO incluidas.
-- El benchmark rolling NO mira la frecuencia futura del periodo de prueba.
-- Esto valida información predictiva; todavía no es un backtest monetario con
-  reglas de compra/venta, spread, slippage, comisiones e impuestos.
+VEREDICTO V1
+{verdict_v1}
 
-VEREDICTO
-{verdict}
+VEREDICTO V2-A
+{verdict_v2}
 """
-
     raw = bt.copy()
     if "date" in raw.columns:
         raw["date"] = pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d")
-
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("predictions_all.csv", raw.to_csv(index=False))
+        z.writestr("model_comparison.csv", comparison.to_csv(index=False))
         z.writestr("calibration.csv", cal.to_csv(index=False))
         z.writestr("directional_signals.csv", dirsum.to_csv(index=False))
         z.writestr("calibration_bins.csv", bins.to_csv(index=False))
-        z.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        z.writestr("performance_by_period.csv", periods.to_csv(index=False))
+        z.writestr("performance_by_ai_regime.csv", regimes.to_csv(index=False))
+        z.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2, default=str))
         z.writestr("README.txt", readme)
     return buffer.getvalue()
 
 
 try:
-    state = get_state()
+    state_v1, state_v2 = get_states()
 except Exception as e:
     st.error(f"No se pudieron descargar los datos históricos: {e}")
     st.stop()
 
-if st.button("▶️ Ejecutar backtest", type="primary"):
-    with st.spinner("Reproduciendo el pasado sin mirar el futuro..."):
-        st.session_state["bt_v1"] = run_bt(state, k, min_train, test_window)
-        st.session_state["bt_params"] = (k, min_train, test_window)
+if st.button("▶️ Ejecutar V1 vs V2-A", type="primary"):
+    with st.spinner("Reproduciendo V1 y V2-A fecha por fecha sin mirar el futuro..."):
+        st.session_state["bt_v2a"] = run_both(state_v1, state_v2, k, min_train, test_window)
+        st.session_state["bt_v2a_params"] = (k, min_train, test_window)
 
-if "bt_v1" not in st.session_state:
-    st.info(
-        "Pulsa **Ejecutar backtest**. El test diario V1.1 evalúa técnicos + "
-        "comportamiento de IREN + BTC + QQQ + NVDA. Todavía NO incluye Gamma histórico ni noticias."
-    )
+if "bt_v2a" not in st.session_state:
+    st.info("Pulsa **Ejecutar V1 vs V2-A**. Después descarga el ZIP completo y envíamelo.")
     st.stop()
 
-bt = st.session_state["bt_v1"]
+bt = st.session_state["bt_v2a"]
 if bt.empty:
-    st.error("No hay muestra suficiente para ejecutar el backtest.")
+    st.error("No hay muestra suficiente.")
     st.stop()
 
 cal = calibration_summary(bt)
 dirsum = directional_summary(bt)
 bins = calibration_bins(bt)
-verdict = human_verdict(cal, dirsum)
+periods = performance_by_period(bt)
+regimes = performance_by_ai_regime(bt)
+comparison = model_comparison(bt)
+verdict_v1 = human_verdict(cal, dirsum, model="V1")
+verdict_v2 = human_verdict(cal, dirsum, model="V2-A")
 
-st.subheader("Conclusión rápida")
-if verdict.startswith("🟢"):
-    st.success(verdict)
-elif verdict.startswith("🟡"):
-    st.warning(verdict)
-else:
-    st.error(verdict)
+st.subheader("🏁 Comparación directa")
+show_cmp = comparison.copy()
+for c in ["Brier skill dirección", "Acierto señales fuertes", "Cobertura señales fuertes", "Retorno firmado medio"]:
+    if c in show_cmp:
+        show_cmp[c] = show_cmp[c].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+st.dataframe(show_cmp, use_container_width=True, hide_index=True)
 
-unique_dates = bt["date"].nunique()
-core = cal[cal["Evento"] == "Cerrar arriba"].copy()
-mean_skill = core["Brier skill"].dropna().mean() if not core.empty else float("nan")
-mean_hit = dirsum["Acierto"].dropna().mean() if not dirsum.empty else float("nan")
-coverage = dirsum["Cobertura"].dropna().mean() if not dirsum.empty else float("nan")
+v2row = comparison[comparison["Modelo"] == "V2-A"]
+v1row = comparison[comparison["Modelo"] == "V1"]
+if not v2row.empty and not v1row.empty:
+    dskill = float(v2row.iloc[0]["Brier skill dirección"] - v1row.iloc[0]["Brier skill dirección"])
+    dhit = float(v2row.iloc[0]["Acierto señales fuertes"] - v1row.iloc[0]["Acierto señales fuertes"])
+    if dskill > 0 and dhit > 0:
+        st.success(f"V2-A mejora V1 en ambos tests principales: Δ Brier skill {dskill:+.1%} · Δ acierto señales {dhit:+.1%}.")
+    else:
+        st.warning(f"V2-A todavía NO mejora limpiamente V1: Δ Brier skill {dskill:+.1%} · Δ acierto señales {dhit:+.1%}.")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Fechas simuladas", f"{unique_dates}")
-c2.metric(
-    "Brier skill medio",
-    "—" if pd.isna(mean_skill) else f"{mean_skill:+.1%}",
-    help=(
-        ">0 significa que mejora a un benchmark rolling que en cada fecha "
-        "sólo conoce el pasado. Cuanto mayor, mejor."
-    ),
-)
-c3.metric(
-    "Acierto señales fuertes",
-    "—" if pd.isna(mean_hit) else f"{mean_hit:.1%}",
-    help="Sólo cuando P(subir) ≥60% o ≤40%.",
-)
-c4.metric("% días con señal fuerte", "—" if pd.isna(coverage) else f"{coverage:.1%}")
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("**V1**")
+    st.write(verdict_v1)
+with c2:
+    st.markdown("**V2-A**")
+    st.write(verdict_v2)
 
-params = st.session_state.get("bt_params", (k, min_train, test_window))
-feedback_zip = build_feedback_zip(bt, cal, dirsum, bins, params, verdict)
+params = st.session_state.get("bt_v2a_params", (k, min_train, test_window))
+feedback_zip = build_feedback_zip(bt, cal, dirsum, bins, periods, regimes, comparison, params, verdict_v1, verdict_v2)
 st.download_button(
-    "⬇️ DESCARGAR TODO EL TEST PARA FEEDBACK (.ZIP)",
+    "⬇️ DESCARGAR TODO V1 vs V2-A PARA FEEDBACK (.ZIP)",
     data=feedback_zip,
     file_name=f"IREN_backtest_feedback_v{BACKTEST_VERSION}.zip",
     mime="application/zip",
     type="primary",
-    help=(
-        "Un solo archivo con todas las predicciones, calibración, señales, "
-        "parámetros y resultados. Mándame directamente este ZIP."
-    ),
 )
-st.caption(
-    "Este botón descarga el test completo, no sólo las 60 filas visibles. "
-    "Es el archivo ideal para mandármelo después de cada iteración."
-)
+st.caption("Mándame este único ZIP. Incluye resultados completos, periodos y regímenes IA.")
 
-st.subheader("¿Cuando el modelo se moja, acierta?")
+st.subheader("¿Cuando se moja, acierta?")
 show_dir = dirsum.copy()
-for col in ["Cobertura", "Acierto", "Retorno medio real"]:
-    show_dir[col] = show_dir[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}")
+for col in ["Cobertura", "Acierto", "Retorno medio real", "Calidad media"]:
+    if col in show_dir:
+        show_dir[col] = show_dir[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}" if col != "Calidad media" else f"{x:.0f}%")
 st.dataframe(show_dir, use_container_width=True, hide_index=True)
 
-st.subheader("Calibración de probabilidades")
-st.caption(
-    "El Brier skill compara ahora contra un benchmark rolling que NO conoce el futuro "
-    "del periodo de test. >0 significa que el motor añade información frente a esa referencia."
-)
-show_cal = cal.copy()
-for col in [
-    "Prob. media",
-    "Ocurrió",
-    "Error calibración",
-    "Brier",
-    "Benchmark prob. media",
-    "Brier benchmark rolling",
-    "Brier skill",
-]:
-    if col in show_cal.columns:
-        show_cal[col] = show_cal[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}")
-st.dataframe(show_cal, use_container_width=True, hide_index=True)
+st.subheader("Calibración dirección")
+core_cal = cal[cal["Evento"] == "Cerrar arriba"].copy()
+for col in ["Prob. media", "Ocurrió", "Error calibración", "Brier", "Benchmark prob. media", "Brier benchmark rolling", "Brier skill"]:
+    if col in core_cal:
+        core_cal[col] = core_cal[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+st.dataframe(core_cal, use_container_width=True, hide_index=True)
 
-st.subheader("Calibración de P(cerrar arriba)")
-st.caption(
-    "Esto ayuda a detectar inversión de señal: por ejemplo, si el motor dice ≥60% "
-    "pero históricamente sube sólo el 40%, tenemos una pista clara de qué está fallando."
-)
-show_bins = bins.copy()
-for col in ["Prob. media", "Ocurrió", "Diferencia"]:
-    if col in show_bins.columns:
-        show_bins[col] = show_bins[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
-st.dataframe(show_bins, use_container_width=True, hide_index=True)
+st.subheader("¿Sigue funcionando con el tiempo?")
+show_periods = periods.copy()
+for col in ["Brier skill", "Acierto señales", "Cobertura"]:
+    if col in show_periods:
+        show_periods[col] = show_periods[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+st.dataframe(show_periods, use_container_width=True, hide_index=True)
 
-st.subheader("Predicción histórica vs realidad")
-st.caption(
-    "Aquí ves las últimas 60 filas. El ZIP de feedback incluye TODAS las filas del test."
-)
-recent = bt.sort_values(["date", "horizon"], ascending=[False, True]).head(60).copy()
-recent["P cerrar arriba"] = recent["p_close_up"].map(lambda x: f"{x:.0%}")
-recent["Benchmark subir"] = recent["base_p_close_up"].map(
-    lambda x: "—" if pd.isna(x) else f"{x:.0%}"
-)
-recent["¿Cerró arriba?"] = recent["actual_close_up"].map(lambda x: "✅" if x else "❌")
-recent["P tocar +5%"] = recent["p_touch_up_5"].map(lambda x: f"{x:.0%}")
-recent["¿Tocó +5%?"] = recent["actual_touch_up_5"].map(lambda x: "✅" if x else "❌")
-recent["P tocar -5%"] = recent["p_touch_down_5"].map(lambda x: f"{x:.0%}")
-recent["¿Tocó -5%?"] = recent["actual_touch_down_5"].map(lambda x: "✅" if x else "❌")
-recent["Retorno real"] = recent["actual_return"].map(lambda x: f"{x:+.1%}")
-recent["date"] = pd.to_datetime(recent["date"]).dt.date
-st.dataframe(
-    recent[
-        [
-            "date",
-            "horizon",
-            "P cerrar arriba",
-            "Benchmark subir",
-            "¿Cerró arriba?",
-            "P tocar +5%",
-            "¿Tocó +5%?",
-            "P tocar -5%",
-            "¿Tocó -5%?",
-            "Retorno real",
-            "confidence",
-            "n_neighbors",
-        ]
-    ],
-    use_container_width=True,
-    hide_index=True,
-)
+st.subheader("¿Qué pasa según el régimen del universo IA?")
+if regimes.empty:
+    st.info("No hay muestra suficiente por régimen.")
+else:
+    show_reg = regimes.copy()
+    for col in ["Brier skill", "Acierto señales", "Cobertura", "Retorno medio IREN"]:
+        if col in show_reg:
+            show_reg[col] = show_reg[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+    st.dataframe(show_reg, use_container_width=True, hide_index=True)
 
-with st.expander("Cómo leer el test"):
+with st.expander("Calibración por bins y últimas predicciones"):
+    show_bins = bins.copy()
+    for col in ["Prob. media", "Ocurrió", "Diferencia"]:
+        if col in show_bins:
+            show_bins[col] = show_bins[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.1%}")
+    st.dataframe(show_bins, use_container_width=True, hide_index=True)
+
+    recent = bt.sort_values(["date", "model", "horizon"], ascending=[False, True, True]).head(80).copy()
+    recent["P↑"] = recent["p_close_up"].map(lambda x: f"{x:.0%}")
+    recent["Real"] = recent["actual_close_up"].map(lambda x: "↑" if x else "↓")
+    recent["Retorno"] = recent["actual_return"].map(lambda x: f"{x:+.1%}")
+    recent["date"] = pd.to_datetime(recent["date"]).dt.date
+    cols = ["date", "model", "horizon", "P↑", "Real", "Retorno", "confidence", "quality_score", "ai_ret5", "rel_ai_5"]
+    st.dataframe(recent[[c for c in cols if c in recent.columns]], use_container_width=True, hide_index=True)
+
+with st.expander("Qué estamos validando"):
     st.markdown(
         """
-- **Walk-forward:** cada fecha histórica se trata como si fuese 'hoy'. Los datos posteriores quedan ocultos hasta después de emitir la predicción.
-- **Benchmark rolling:** para cada fecha y horizonte usa sólo resultados que ya habían terminado entonces. No conoce el futuro del periodo de test.
-- **Brier skill > 0:** el motor mejora al benchmark rolling. < 0 es mala señal.
-- **Acierto señales fuertes:** porcentaje de aciertos cuando el modelo dice ≥60% de subir o ≤40% de subir.
-- **Cobertura:** qué porcentaje de días se atreve a dar una señal fuerte.
-- **Calibración por rangos:** comprueba si un 60% del modelo se comporta realmente como un ~60%.
-- **Este test NO valida Gamma:** para Gamma necesitamos histórico de cadenas de opciones/GEX.
-- **Tampoco es aún un backtest de dinero real:** faltan reglas exactas de entrada/salida, spread, slippage, comisiones e impuestos.
+- **V1** = técnicos/precio IREN + BTC + QQQ + NVDA.
+- **V2-A** = técnicos/precio IREN + factor IA dinámico + fuerza relativa + breadth/dispersion + QQQ/VIX/BTC + recencia.
+- El factor IA pondera cada componente según su correlación reciente con IREN; no fijamos para siempre que NVDA/MU/MRVL pesen igual.
+- **Gamma y noticias siguen fuera**: no entrarán en P↑/P↓ hasta demostrar que añaden edge.
+- `performance_by_period.csv` sirve para detectar concept drift: una mejora que sólo existe en un tramo no nos vale.
+- `performance_by_ai_regime.csv` comprueba si el modelo funciona distinto cuando el universo IA está risk-on, mixto o risk-off.
 """
     )
