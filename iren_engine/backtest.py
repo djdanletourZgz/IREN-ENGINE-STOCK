@@ -8,42 +8,106 @@ import pandas as pd
 from .probability import daily_probabilities
 
 
-def _historical_base_rates(
+def _build_base_rate_cache(
     state: pd.DataFrame,
+    horizons=(1, 3, 5),
+    thresholds=(0.03, 0.05, 0.10),
+) -> dict[int, dict[str, np.ndarray]]:
+    """Precalcula benchmarks rolling sin leakage en O(n*h).
+
+    Para una predicción emitida en ``pos`` y horizonte ``h`` sólo cuenta
+    entradas ``i <= pos-h``: esos resultados ya habían terminado en esa fecha.
+    Sustituye el antiguo bucle que reconstruía TODO el histórico para cada
+    predicción, horizonte y modelo.
+    """
+    n = len(state)
+    if n == 0:
+        return {}
+
+    close = state["Close"].to_numpy(dtype=float)
+    high = state["High"].to_numpy(dtype=float)
+    low = state["Low"].to_numpy(dtype=float)
+    cache: dict[int, dict[str, np.ndarray]] = {}
+
+    for h in horizons:
+        events: dict[str, np.ndarray] = {
+            "close_up": np.full(n, np.nan, dtype=float),
+        }
+        for t in thresholds:
+            key = int(t * 100)
+            events[f"touch_up_{key}"] = np.full(n, np.nan, dtype=float)
+            events[f"touch_down_{key}"] = np.full(n, np.nan, dtype=float)
+
+        valid_entry = np.zeros(n, dtype=bool)
+        last_entry = n - h
+        for i in range(max(last_entry, 0)):
+            entry = close[i]
+            fut_close = close[i + h]
+            fut_high = high[i + 1 : i + h + 1]
+            fut_low = low[i + 1 : i + h + 1]
+            if (
+                not np.isfinite(entry)
+                or not np.isfinite(fut_close)
+                or len(fut_high) < h
+                or len(fut_low) < h
+                or not np.isfinite(fut_high).all()
+                or not np.isfinite(fut_low).all()
+            ):
+                continue
+            valid_entry[i] = True
+            ret = fut_close / entry - 1.0
+            up = float(np.max(fut_high) / entry - 1.0)
+            down = float(np.min(fut_low) / entry - 1.0)
+            events["close_up"][i] = float(ret > 0)
+            for t in thresholds:
+                key = int(t * 100)
+                events[f"touch_up_{key}"][i] = float(up >= t)
+                events[f"touch_down_{key}"][i] = float(down <= -t)
+
+        valid_cum = np.cumsum(valid_entry.astype(int))
+        out: dict[str, np.ndarray] = {
+            "n": np.zeros(n, dtype=float),
+        }
+        cumsums = {
+            name: np.cumsum(np.nan_to_num(values, nan=0.0))
+            for name, values in events.items()
+        }
+        for name in events:
+            out[name] = np.full(n, np.nan, dtype=float)
+
+        for pos in range(n):
+            cutoff = pos - h
+            if cutoff < 0:
+                continue
+            count = int(valid_cum[cutoff])
+            if count <= 0:
+                continue
+            out["n"][pos] = float(count)
+            for name, cs in cumsums.items():
+                out[name][pos] = float(cs[cutoff] / count)
+        cache[int(h)] = out
+
+    return cache
+
+
+def _cached_base_rates(
+    cache: dict[int, dict[str, np.ndarray]],
     pos: int,
     horizon: int,
-    thresholds=(0.03, 0.05, 0.10),
 ) -> dict[str, float]:
-    """Base-rate disponible en tiempo real usando sólo pasado ya resuelto."""
-    rows = []
-    last_entry_pos = pos - horizon
-    if last_entry_pos < 0:
+    hcache = cache.get(int(horizon), {})
+    if not hcache:
         return {}
-
-    for i in range(0, last_entry_pos + 1):
-        entry = float(state.iloc[i]["Close"])
-        fut = state.iloc[i + 1 : i + horizon + 1]
-        if len(fut) < horizon or not np.isfinite(entry):
-            continue
-        if not np.isfinite(fut[["High", "Low", "Close"]].to_numpy(dtype=float)).all():
-            continue
-        rows.append(
-            {
-                "ret": float(fut.iloc[-1]["Close"] / entry - 1),
-                "up": float(fut["High"].max() / entry - 1),
-                "down": float(fut["Low"].min() / entry - 1),
-            }
-        )
-
-    r = pd.DataFrame(rows)
-    if r.empty:
+    n_arr = hcache.get("n")
+    if n_arr is None or pos >= len(n_arr) or n_arr[pos] <= 0:
         return {}
-
-    out = {"close_up": float((r["ret"] > 0).mean()), "n": int(len(r))}
-    for t in thresholds:
-        key = int(t * 100)
-        out[f"touch_up_{key}"] = float((r["up"] >= t).mean())
-        out[f"touch_down_{key}"] = float((r["down"] <= -t).mean())
+    out = {"n": int(n_arr[pos])}
+    for key, arr in hcache.items():
+        if key == "n" or pos >= len(arr):
+            continue
+        v = arr[pos]
+        if np.isfinite(v):
+            out[key] = float(v)
     return out
 
 
@@ -67,18 +131,22 @@ def walk_forward_backtest(
     state = state.sort_index().copy()
     max_h = max(horizons)
 
-    positions = []
-    for pos in range(min_train, len(state) - max_h):
-        row = state.iloc[pos]
-        if np.isfinite(row["Close"]):
-            positions.append(pos)
-
+    positions = [
+        pos
+        for pos in range(min_train, len(state) - max_h)
+        if np.isfinite(state.iloc[pos]["Close"])
+    ]
     if test_window and len(positions) > test_window:
         positions = positions[-test_window:]
 
+    # Coste O(n) una sola vez por modelo, en vez de reconstruir el benchmark
+    # miles de veces dentro del walk-forward.
+    base_cache = _build_base_rate_cache(state, horizons=horizons, thresholds=thresholds)
+
     records = []
     for pos in positions:
-        truncated = state.iloc[: pos + 1].copy()
+        # Una vista/copia pequeña sigue garantizando que el predictor no ve futuro.
+        truncated = state.iloc[: pos + 1]
         try:
             pred = predictor(
                 truncated,
@@ -108,7 +176,7 @@ def walk_forward_backtest(
             actual_ret = float(fut.iloc[-1]["Close"] / entry - 1)
             actual_up = float(fut["High"].max() / entry - 1)
             actual_down = float(fut["Low"].min() / entry - 1)
-            base = _historical_base_rates(state, pos, h, thresholds=thresholds)
+            base = _cached_base_rates(base_cache, pos, h)
 
             rec = {
                 "model": model_name,
