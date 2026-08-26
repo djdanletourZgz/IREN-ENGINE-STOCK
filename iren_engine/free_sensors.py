@@ -446,6 +446,8 @@ def finra_features(finra: pd.DataFrame, daily_iren: pd.DataFrame, z_window: int 
     if finra is None or finra.empty or daily_iren is None or daily_iren.empty:
         return pd.DataFrame()
     f = finra.copy().sort_values("date")
+    # Fuerza una resolución homogénea para evitar diferencias pandas s/us/ns.
+    f["date"] = pd.to_datetime(f["date"], errors="coerce").astype("datetime64[ns]")
     ratio = f["short_ratio"].astype(float)
     mean = ratio.shift(1).rolling(z_window, min_periods=max(8, z_window // 2)).mean()
     std = ratio.shift(1).rolling(z_window, min_periods=max(8, z_window // 2)).std()
@@ -453,7 +455,7 @@ def finra_features(finra: pd.DataFrame, daily_iren: pd.DataFrame, z_window: int 
     f["short_ratio_delta"] = ratio.diff()
 
     d = daily_iren[["Close"]].copy().sort_index()
-    d["date"] = pd.to_datetime(pd.DatetimeIndex(d.index).date)
+    d["date"] = pd.to_datetime(pd.DatetimeIndex(d.index).date).astype("datetime64[ns]")
     d = d.drop_duplicates("date", keep="last").reset_index(drop=True)
     for h in (1, 2, 3):
         d[f"future_{h}D"] = d["Close"].shift(-h) / d["Close"] - 1.0
@@ -492,12 +494,29 @@ def attach_prior_finra_to_divergence(events: pd.DataFrame, finra_features_df: pd
     if events is None or events.empty or finra_features_df is None or finra_features_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     e = events.copy()
-    e["event_date"] = pd.to_datetime(pd.to_datetime(e["timestamp"]).dt.date)
-    f = finra_features_df[["date", "short_ratio", "short_ratio_z", "short_ratio_delta"]].dropna(subset=["date"]).sort_values("date").copy()
+
+    # `merge_asof` exige que ambas claves tengan EXACTAMENTE el mismo dtype.
+    # Pandas puede crear datetime64[s], [us] o [ns] según el origen; normalizamos
+    # explícitamente a nanosegundos y a fecha local de NY antes de unir.
+    ts = pd.to_datetime(e["timestamp"], errors="coerce", utc=True)
+    event_date = ts.dt.tz_convert("America/New_York").dt.tz_localize(None).dt.normalize()
+    e["event_date"] = event_date.astype("datetime64[ns]")
+
+    f = finra_features_df[["date", "short_ratio", "short_ratio_z", "short_ratio_delta"]].copy()
+    f["date"] = pd.to_datetime(f["date"], errors="coerce").astype("datetime64[ns]")
+    f = f.dropna(subset=["date"]).sort_values("date")
+
     # Para un evento intradía del día D sólo usamos FINRA de D-1 o anterior,
     # porque el volumen short de D se publica después del cierre.
-    e = e.sort_values("event_date")
-    merged = pd.merge_asof(e, f, left_on="event_date", right_on="date", direction="backward", allow_exact_matches=False)
+    e = e.dropna(subset=["event_date"]).sort_values("event_date")
+    merged = pd.merge_asof(
+        e,
+        f,
+        left_on="event_date",
+        right_on="date",
+        direction="backward",
+        allow_exact_matches=False,
+    )
     merged["finra_context"] = np.select(
         [merged["short_ratio_z"] >= 1.0, merged["short_ratio_z"] <= -1.0],
         ["SHORT VOL ALTO", "SHORT VOL BAJO"],
